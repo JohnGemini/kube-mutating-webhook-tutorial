@@ -1,0 +1,12 @@
+apiVersion: certificates.k8s.io/v1beta1
+kind: CertificateSigningRequest
+metadata:
+  name: webhook-csr
+spec:
+  groups:
+  - system:authenticated
+  request: CSR_REQUEST
+  usages:
+  - digital signature
+  - key encipherment
+  - server auth

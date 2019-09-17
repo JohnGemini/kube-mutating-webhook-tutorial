@@ -1,254 +1,194 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"net/http"
-	"strings"
+    "encoding/json"
+    "fmt"
+    "errors"
+    "strings"
+    "io/ioutil"
+    "net/http"
 
-	"github.com/ghodss/yaml"
-	"github.com/golang/glog"
-	"k8s.io/api/admission/v1beta1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/kubernetes/pkg/apis/core/v1"
+    "github.com/golang/glog"
+    "k8s.io/api/admission/v1beta1"
+    corev1 "k8s.io/api/core/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/rest"
+    "k8s.io/apimachinery/pkg/runtime"
+    "k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
 var (
-	runtimeScheme = runtime.NewScheme()
-	codecs        = serializer.NewCodecFactory(runtimeScheme)
-	deserializer  = codecs.UniversalDeserializer()
+    runtimeScheme = runtime.NewScheme()
+    codecs        = serializer.NewCodecFactory(runtimeScheme)
+    deserializer  = codecs.UniversalDeserializer()
+)
 
-	// (https://github.com/kubernetes/kubernetes/issues/57982)
-	defaulter = runtime.ObjectDefaulter(runtimeScheme)
+const (
+    validateRequiredKey   = "desc"
+    validateRequiredValue = "transparent mode namespace"
 )
 
 var ignoredNamespaces = []string {
-	metav1.NamespaceSystem,
-	metav1.NamespacePublic,
+    metav1.NamespaceSystem,
+    metav1.NamespacePublic,
+    metav1.NamespaceDefault,
 }
-
-const (
-	admissionWebhookAnnotationInjectKey = "sidecar-injector-webhook.morven.me/inject"
-	admissionWebhookAnnotationStatusKey = "sidecar-injector-webhook.morven.me/status"
-)
 
 type WebhookServer struct {
-	sidecarConfig    *Config
-	server           *http.Server
+	server            *http.Server
+    ResourceCPU       string
+    ResourceGPU       string
+    ResourceMemory    string
 }
 
-// Webhook Server parameters
-type WhSvrParameters struct {
-	port int                 // webhook server port
-	certFile string          // path to the x509 certificate for https
-	keyFile string           // path to the x509 private key matching `CertFile`
-	sidecarCfgFile string    // path to sidecar injector configuration file
-}
-
-type Config struct {
-	Containers  []corev1.Container  `yaml:"containers"`
-	Volumes     []corev1.Volume     `yaml:"volumes"`
-}
-
-type patchOperation struct {
-	Op    string      `json:"op"`
-	Path  string      `json:"path"`
-	Value interface{} `json:"value,omitempty"`
-}
-
-func init() {
-	_ = corev1.AddToScheme(runtimeScheme)
-	_ = admissionregistrationv1beta1.AddToScheme(runtimeScheme)
-	// defaulting with webhooks:
-	// https://github.com/kubernetes/kubernetes/issues/57982
-	_ = v1.AddToScheme(runtimeScheme)
-}
-
-// (https://github.com/kubernetes/kubernetes/issues/57982)
-func applyDefaultsWorkaround(containers []corev1.Container, volumes []corev1.Volume) {
-	defaulter.Default(&corev1.Pod {
-		Spec: corev1.PodSpec {
-			Containers:     containers,
-			Volumes:        volumes,
-		},
-	})
-}
-
-func loadConfig(configFile string) (*Config, error) {
-	data, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		return nil, err
-	}
-	glog.Infof("New configuration: sha256sum %x", sha256.Sum256(data))
-	
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	
-	return &cfg, nil
-}
-
-// Check whether the target resoured need to be mutated
-func mutationRequired(ignoredList []string, metadata *metav1.ObjectMeta) bool {
+// Check whether the target need to be validated
+func validationRequired(ignoredList []string, metadata *metav1.ObjectMeta) bool {
 	// skip special kubernete system namespaces
 	for _, namespace := range ignoredList {
 		if metadata.Namespace == namespace {
-			glog.Infof("Skip mutation for %v for it' in special namespace:%v", metadata.Name, metadata.Namespace)
+			glog.Infof("Skip validation for %v for it's in special namespace: %v",
+                       metadata.Name, metadata.Namespace)
 			return false
 		}
 	}
 
-	annotations := metadata.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-
-	status := annotations[admissionWebhookAnnotationStatusKey]
-	
-	// determine whether to perform mutation based on annotation for the target resource
-	var required bool
-	if strings.ToLower(status) == "injected" {
-		required = false;
-	} else {
-		switch strings.ToLower(annotations[admissionWebhookAnnotationInjectKey]) {
-		default:
-			required = false
-		case "y", "yes", "true", "on":
-			required = true
-		}
-	}
-	
-	glog.Infof("Mutation policy for %v/%v: status: %q required:%v", metadata.Namespace, metadata.Name, status, required)
-	return required
-}
-
-func addContainer(target, added []corev1.Container, basePath string) (patch []patchOperation) {
-	first := len(target) == 0
-	var value interface{}
-	for _, add := range added {
-		value = add
-		path := basePath
-		if first {
-			first = false
-			value = []corev1.Container{add}
-		} else {
-			path = path + "/-"
-		}
-		patch = append(patch, patchOperation {
-			Op:    "add",
-			Path:  path,
-			Value: value,
-		})
-	}
-	return patch
-}
-
-func addVolume(target, added []corev1.Volume, basePath string) (patch []patchOperation) {
-	first := len(target) == 0
-	var value interface{}
-	for _, add := range added {
-		value = add
-		path := basePath
-		if first {
-			first = false
-			value = []corev1.Volume{add}
-		} else {
-			path = path + "/-"
-		}
-		patch = append(patch, patchOperation {
-			Op:    "add",
-			Path:  path,
-			Value: value,
-		})
-	}
-	return patch
-}
-
-func updateAnnotation(target map[string]string, added map[string]string) (patch []patchOperation) {
-	for key, value := range added {
-		if target == nil || target[key] == "" {
-			target = map[string]string{}
-			patch = append(patch, patchOperation {
-				Op:   "add",
-				Path: "/metadata/annotations",
-				Value: map[string]string{
-					key: value,
-				},
-			})
-		} else {
-			patch = append(patch, patchOperation {
-				Op:    "replace",
-				Path:  "/metadata/annotations/" + key,
-				Value: value,
-			})
-		}
-	}
-	return patch
-}
-
-// create mutation patch for resoures
-func createPatch(pod *corev1.Pod, sidecarConfig *Config, annotations map[string]string) ([]byte, error) {
-	var patch []patchOperation
-	
-	patch = append(patch, addContainer(pod.Spec.Containers, sidecarConfig.Containers, "/spec/containers")...)
-	patch = append(patch, addVolume(pod.Spec.Volumes, sidecarConfig.Volumes, "/spec/volumes")...)
-	patch = append(patch, updateAnnotation(pod.Annotations, annotations)...)
-
-	return json.Marshal(patch)
-}
-
-// main mutation process
-func (whsvr *WebhookServer) mutate(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
-	req := ar.Request
-	var pod corev1.Pod
-	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
-		glog.Errorf("Could not unmarshal raw object: %v", err)
-		return &v1beta1.AdmissionResponse {
-			Result: &metav1.Status {
-				Message: err.Error(),
-			},
-		}
-	}
-
-	glog.Infof("AdmissionReview for Kind=%v, Namespace=%v Name=%v (%v) UID=%v patchOperation=%v UserInfo=%v",
-		req.Kind, req.Namespace, req.Name, pod.Name, req.UID, req.Operation, req.UserInfo)
-	
-	// determine whether to perform mutation
-	if !mutationRequired(ignoredNamespaces, &pod.ObjectMeta) {
-		glog.Infof("Skipping mutation for %s/%s due to policy check", pod.Namespace, pod.Name)
-		return &v1beta1.AdmissionResponse {
-			Allowed: true, 
-		}
-	}
-	
-	// Workaround: https://github.com/kubernetes/kubernetes/issues/57982
-	applyDefaultsWorkaround(whsvr.sidecarConfig.Containers, whsvr.sidecarConfig.Volumes)
-	annotations := map[string]string{admissionWebhookAnnotationStatusKey: "injected"}
-	patchBytes, err := createPatch(&pod, whsvr.sidecarConfig, annotations)
+    // get the in-cluster config
+    config, err := rest.InClusterConfig()
+    if err != nil {
+        panic(err.Error())
+    }
+    // get a k8s client
+    client, err := kubernetes.NewForConfig(config)
 	if err != nil {
+		panic(err.Error())
+	}
+    // get Namespace object by name
+    namespace, err := client.CoreV1().Namespaces().Get(metadata.Namespace,
+                                                       metav1.GetOptions{})
+    if err != nil {
+		panic(err.Error())
+	}
+
+    annotations := namespace.ObjectMeta.GetAnnotations()
+    if annotations == nil {
+        annotations = map[string]string{}
+    }
+    // determine whether to perform validation based on annotations of the target's namespace
+    if val, ok := annotations[validateRequiredKey]; ok {
+        if strings.Contains(val, validateRequiredValue) {
+            return true
+        }
+    }
+    glog.Infof("Skip validation for %v for there is no annotation %v='.* %v' in namespace %v",
+               metadata.Name, validateRequiredKey,
+               validateRequiredValue, metadata.Namespace)
+    return false
+}
+
+// get PodSpec from the request
+func getPodSpec(req *v1beta1.AdmissionRequest) (*corev1.PodSpec, error) {
+    var (
+        kind, name, namespace      string
+        metadata                   *metav1.ObjectMeta
+        spec                       *corev1.PodSpec
+    )
+    switch req.Kind.Kind {
+        case "ReplicationController":
+            var obj corev1.ReplicationController
+            if err := json.Unmarshal(req.Object.Raw, &obj); err != nil {
+                return nil, err
+            }
+            kind, name, namespace, metadata, spec = req.Kind.Kind, obj.Name,
+                obj.Namespace, &obj.ObjectMeta, &obj.Spec.Template.Spec
+        case "Pod":
+            var obj corev1.Pod
+            if err := json.Unmarshal(req.Object.Raw, &obj); err != nil {
+                return nil, err
+            }
+            kind, name, namespace, metadata, spec = req.Kind.Kind, obj.Name,
+                obj.Namespace, &obj.ObjectMeta, &obj.Spec
+        default:
+            return nil, nil
+    }
+
+    glog.Infof("AdmissionReview for Kind=%v Namespace=%v Name=%v",
+               kind, namespace, name)
+
+	// determine whether to perform validation
+	if !validationRequired(ignoredNamespaces, metadata) {
+        return nil, nil
+	} else {
+        return spec, nil
+    }
+}
+
+func (whsvr *WebhookServer) limitsValidate(containers []corev1.Container) error {
+    resourceLimits := map[string]float64 {
+        whsvr.ResourceCPU:    0,
+        whsvr.ResourceGPU:    0,
+        whsvr.ResourceMemory: 0,
+    }
+    for _, container := range containers {
+        if container.Resources.Limits != nil {
+            limits := container.Resources.Limits
+            for resourceName := range resourceLimits {
+                if quantity, ok := limits[corev1.ResourceName(resourceName)]; ok {
+                    val := float64(quantity.Value())
+                    if resourceName == whsvr.ResourceMemory {
+                        val /= (1024 * 1024)
+                    }
+                    resourceLimits[resourceName] += val
+                } else {
+                    return errors.New(fmt.Sprintf("%v is required", resourceName))
+                }
+            }
+        } else {
+            return errors.New("container[*].resources.limits is required")
+        }
+    }
+	glog.Infof("resourceLimits: %v", resourceLimits)
+    limit_cpu := resourceLimits[whsvr.ResourceGPU] * 4
+    limit_memory := resourceLimits[whsvr.ResourceGPU] * 90 * 1024
+    if (resourceLimits[whsvr.ResourceGPU] <= 8 &&
+        resourceLimits[whsvr.ResourceGPU] >= 1) {
+        if resourceLimits[whsvr.ResourceCPU] > limit_cpu {
+            return errors.New(fmt.Sprintf("%v exceeds the limit of %v",
+                                          whsvr.ResourceCPU, limit_cpu))
+        } else if resourceLimits[whsvr.ResourceMemory] > limit_memory {
+            return errors.New(fmt.Sprintf("%v exceeds the limit of %v",
+                                          whsvr.ResourceMemory, limit_memory))
+        }
+    } else {
+        return errors.New(fmt.Sprintf("%v exceeds the range from 1 to 8",
+                                      whsvr.ResourceGPU))
+    }
+    return nil
+}
+
+// main validation process
+func (whsvr *WebhookServer) validate(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
+	req := ar.Request
+    if spec, err := getPodSpec(req); err != nil {
+        glog.Errorf("Could not unmarshal raw object: %v", err)
 		return &v1beta1.AdmissionResponse {
 			Result: &metav1.Status {
 				Message: err.Error(),
 			},
 		}
-	}
-	
-	glog.Infof("AdmissionResponse: patch=%v\n", string(patchBytes))
-	return &v1beta1.AdmissionResponse {
-		Allowed: true,
-		Patch:   patchBytes,
-		PatchType: func() *v1beta1.PatchType {
-			pt := v1beta1.PatchTypeJSONPatch
-			return &pt
-		}(),
-	}
+    } else if spec != nil {
+        if err := whsvr.limitsValidate(spec.Containers); err != nil {
+            glog.Errorf("Validation fails: %v", err)
+            return &v1beta1.AdmissionResponse {
+                Result: &metav1.Status {
+                    Message: err.Error(),
+                },
+            }
+        }
+    }
+    return &v1beta1.AdmissionResponse {
+        Allowed: true,
+    }
 }
 
 // Serve method for webhook server
@@ -269,7 +209,8 @@ func (whsvr *WebhookServer) serve(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 	if contentType != "application/json" {
 		glog.Errorf("Content-Type=%s, expect application/json", contentType)
-		http.Error(w, "invalid Content-Type, expect `application/json`", http.StatusUnsupportedMediaType)
+		http.Error(w, "invalid Content-Type, expect `application/json`",
+                   http.StatusUnsupportedMediaType)
 		return
 	}
 
@@ -283,7 +224,7 @@ func (whsvr *WebhookServer) serve(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 	} else {
-		admissionResponse = whsvr.mutate(&ar)
+		admissionResponse = whsvr.validate(&ar)
 	}
 
 	admissionReview := v1beta1.AdmissionReview{}
@@ -297,11 +238,13 @@ func (whsvr *WebhookServer) serve(w http.ResponseWriter, r *http.Request) {
 	resp, err := json.Marshal(admissionReview)
 	if err != nil {
 		glog.Errorf("Can't encode response: %v", err)
-		http.Error(w, fmt.Sprintf("could not encode response: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("could not encode response: %v", err),
+                   http.StatusInternalServerError)
 	}
 	glog.Infof("Ready to write reponse ...")
 	if _, err := w.Write(resp); err != nil {
 		glog.Errorf("Can't write response: %v", err)
-		http.Error(w, fmt.Sprintf("could not write response: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("could not write response: %v", err),
+                   http.StatusInternalServerError)
 	}
 }
